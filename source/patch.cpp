@@ -1,20 +1,16 @@
 #include "patch.h"
 
-int GOLDHEN_OFFSET = -1;
-
-bool check_for_goldhen()
-{
-  if (GOLDHEN_OFFSET == -1)
-  {
-    uint64_t tmp;
-    if (orbis_syscall(107, NULL, &tmp) != 0)
-      GOLDHEN_OFFSET = 90;
-    else
-      GOLDHEN_OFFSET = 0;
-  }
-
-  return GOLDHEN_OFFSET == 90;
-}
+// -----------------------------------------------------------------------
+// GoldHEN 2.4b18.12 compatibility fix:
+// The old check_for_goldhen() + manual orbis_syscall(108 + GOLDHEN_OFFSET)
+// approach broke because syscall 107 no longer behaves the same way in
+// newer GoldHEN versions, causing the offset detection to misfire and
+// pick the wrong syscall number.
+//
+// Fix: use sys_sdk_proc_rw() from plugin_common.h (pulled in via patch.h).
+// The SDK function is version-aware and maintained alongside each GoldHEN
+// release, so it's always correct for the running GoldHEN version.
+// -----------------------------------------------------------------------
 
 char *unescape(const char *s)
 {
@@ -135,34 +131,31 @@ extern "C" u8 *hexstrtochar2(const char *hexstr, s64 *size)
     return data;
 }
 
+// sys_proc_rw / sys_proc_ro — delegate to sys_sdk_proc_rw from the GoldHEN
+// SDK (plugin_common.h).  The SDK function performs its own GoldHEN-version
+// detection and is updated with each GoldHEN release, so it always picks
+// the correct syscall number.  The previous hand-rolled detection
+// (check_for_goldhen / GOLDHEN_OFFSET / orbis_syscall(108+offset)) broke on
+// GoldHEN v2.4b18.12 because syscall 107 no longer behaves as expected,
+// yielding the wrong offset and crashing plugin_load.
+
 extern "C" void sys_proc_rw(u64 Address, void *Data, u64 Length)
 {
-    check_for_goldhen();
-    
     if (!Address || !Length)
     {
         final_printf("No target (0x%lx) or length (%li) provided!\n", Address, Length);
         return;
     }
-#if 0
-    sceKernelMprotect((void*)Address, Length, VM_PROT_ALL);
-    memcpy((void*)Address, Data, Length);
-#else
     struct proc_rw process_rw_data{};
     process_rw_data.address = Address;
-    process_rw_data.data = Data;
-    process_rw_data.length = Length;
+    process_rw_data.data    = Data;
+    process_rw_data.length  = Length;
     process_rw_data.write_flags = 1;
-    //sys_sdk_proc_rw(&process_rw_data);
-    orbis_syscall(108 + GOLDHEN_OFFSET, getpid(), process_rw_data.address,
-                  process_rw_data.data, process_rw_data.length, process_rw_data.write_flags);
-#endif
+    sys_sdk_proc_rw(&process_rw_data);
 }
 
 extern "C" void sys_proc_ro(u64 Address, void *Data, u64 Length)
 {
-    check_for_goldhen();
-    
     if (!Address || !Length)
     {
         final_printf("No target (0x%lx) or length (%li) provided!\n", Address, Length);
@@ -170,13 +163,10 @@ extern "C" void sys_proc_ro(u64 Address, void *Data, u64 Length)
     }
     struct proc_rw process_rw_data{};
     process_rw_data.address = Address;
-    process_rw_data.data = Data;
-    process_rw_data.length = Length;
+    process_rw_data.data    = Data;
+    process_rw_data.length  = Length;
     process_rw_data.write_flags = 0;
-    //sys_sdk_proc_rw(&process_rw_data);
-
-    orbis_syscall(108 + GOLDHEN_OFFSET, getpid(), process_rw_data.address,
-                  process_rw_data.data, process_rw_data.length, process_rw_data.write_flags);
+    sys_sdk_proc_rw(&process_rw_data);
 }
 
 extern "C" bool hex_prefix(const char *str)

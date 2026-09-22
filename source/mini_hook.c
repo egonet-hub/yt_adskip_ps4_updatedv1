@@ -45,12 +45,10 @@ static void emit_abs_jmp_stub(uint8_t *dst, uint64_t target) {
 
 // ---- Install ---------------------------------------------------------------
 int mh_install(mh_hook_t *h) {
-    //if (!h || !h->target_addr || !h->user_impl) return -1;
-    
-    // After — allow wrapper (no user_impl) and thunk (both provided)
-    if (!h || !h->target_addr ){//|| !h->user_thunk) {
+    if (!h || !h->target_addr) {
         mh_log("[mini_hook] bad args: h=%p tgt=%p thunk=%p impl=%p\n",
-           (void*)h, (void*)h->target_addr, h ? h->user_thunk : 0, h ? h->user_impl : 0);
+           (void*)h, (void*)(h ? h->target_addr : 0),
+           h ? h->user_thunk : 0, h ? h->user_impl : 0);
         return -1;
     }
     if (h->installed) return 0;
@@ -66,14 +64,45 @@ int mh_install(mh_hook_t *h) {
     // 2) Save original bytes
     memcpy(h->original, (void *)h->target_addr, stolen);
 
-    // 3) Allocate executable trampoline page
-    // NOTE: On PPPwn, must use address hint in library space (not 0)
+    // 3) Allocate executable trampoline page.
+    //
+    //    We use an absolute indirect JMP (FF 25 + 8-byte target), so the
+    //    trampoline does NOT need to be within ±2 GB of the hook site.
+    //    The address hint 0x0000000900000000 was a PPPwn optimisation;
+    //    it may be unavailable on newer setups, so we fall back gracefully.
+    //
+    //    Attempt order:
+    //      1. sceKernelMmap with PPPwn hint (preserves old behaviour)
+    //      2. sceKernelMmap with NULL hint (let the kernel choose)
+    //      3. POSIX mmap as a last resort
     void *tramp = NULL;
+    int   ret   = -1;
+
+    // Attempt 1: PPPwn-compatible hint
     void *addr_hint = (void*)0x0000000900000000ULL;
-    int ret = sceKernelMmap(addr_hint, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0, &tramp);
+    ret = sceKernelMmap(addr_hint, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0, &tramp);
     if (ret < 0 || !tramp) {
-        mh_log("[mini_hook] sceKernelMmap failed: ret=0x%X tramp=%p\n", ret, tramp);
+        mh_log("[mini_hook] hint mmap failed (ret=0x%X), trying NULL hint\n", ret);
+        tramp = NULL;
+
+        // Attempt 2: any kernel-chosen address
+        ret = sceKernelMmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0, &tramp);
+    }
+
+    if (ret < 0 || !tramp) {
+        mh_log("[mini_hook] sceKernelMmap(NULL) failed (ret=0x%X), trying POSIX mmap\n", ret);
+        // Attempt 3: POSIX mmap — note mh_remove will still call sceKernelMunmap,
+        // which on PS4 is effectively the same as munmap for anonymous mappings.
+        tramp = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        ret = (tramp && tramp != MAP_FAILED) ? 0 : -1;
+        if (ret < 0) tramp = NULL;
+    }
+
+    if (ret < 0 || !tramp) {
+        mh_log("[mini_hook] all mmap attempts failed: ret=0x%X tramp=%p\n", ret, tramp);
         return -3;
     }
     h->tramp_mem = tramp;
@@ -120,11 +149,10 @@ int mh_install(mh_hook_t *h) {
 
     sys_proc_rw(h->target_addr, patch, stolen);
 
-    // 7) Thunk mode only: user’s thunk ends with `jmp *slot(%rip)`. Bind slot -> trampoline.
+    // 7) Thunk mode only: user's thunk ends with `jmp *slot(%rip)`. Bind slot -> trampoline.
     if (h->mode == MH_MODE_THUNK && h->thunk_slot) {
         // write the trampoline pointer into the slot
         *(volatile void**)h->thunk_slot = h->tramp_mem;
-        // (If you can’t directly write here, add a proc_rw variant to do so safely.)
     }
 
     h->installed = true;
